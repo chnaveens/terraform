@@ -4,7 +4,10 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -177,15 +180,49 @@ func (t *Tree) Load(s getter.Storage, mode GetMode) error {
 		copy(path, t.path)
 		path = append(path, m.Name)
 
+		// Get the directory where this module is so we can load it
+		// The key is the string being hashed to uniquely id the Source.  The
+		// leading digit can be incremented to re-fetch all existing modules.
+		key := fmt.Sprintf("0.root.%s-%s", strings.Join(path, "."), m.Source)
+
 		log.Printf("[TRACE] module source %q", m.Source)
 		// Split out the subdir if we have one.
-		// Terraform keeps the entire request tree for now, so that modules can
+		// Terraform keeps the entire requested tree for now, so that modules can
 		// reference sibling modules from the same archive or repo.
 		source, subDir := getter.SourceDirSubdir(m.Source)
 
+		// First check if we we need to download anything.
+		// This is also checked by the getter.Storage implementation, but we
+		// want to be able to short-circuit the detection as well, since some
+		// detectors may need to make external calls.
+		dir, found, err := s.Dir(key)
+		if err != nil {
+			return err
+		}
+
+		// looks like we already have it
+		// In order to load the Tree we need to find out if there was another
+		// subDir stored from discovery.
+		if found && mode != GetModeUpdate {
+			subDir, err := t.getSubdir(dir)
+			if err != nil {
+				log.Println("[WARN] error reading subdir record:", err)
+			} else {
+				dir := filepath.Join(dir, subDir)
+				// Load the configurations.Dir(source)
+				children[m.Name], err = NewTreeModule(m.Name, dir)
+				if err != nil {
+					return fmt.Errorf("module %s: %s", m.Name, err)
+				}
+				// Set the path of this child
+				children[m.Name].path = path
+				continue
+			}
+		}
+
 		log.Printf("[TRACE] module source: %q", source)
 
-		source, err := getter.Detect(source, t.config.Dir, detectors)
+		source, err = getter.Detect(source, t.config.Dir, detectors)
 		if err != nil {
 			return fmt.Errorf("module %s: %s", m.Name, err)
 		}
@@ -208,13 +245,6 @@ func (t *Tree) Load(s getter.Storage, mode GetMode) error {
 
 		log.Printf("[TRACE] getting module source %q", source)
 
-		// Get the directory where this module is so we can load it
-		key := strings.Join(path, ".")
-
-		// The key is the string being hashed to uniquely id the Source.  The
-		// leading digit can be incremented to re-fetch all existing modules.
-		key = fmt.Sprintf("0.root.%s-%s", key, m.Source)
-
 		dir, ok, err := getStorage(s, key, source, mode)
 		if err != nil {
 			return err
@@ -224,19 +254,31 @@ func (t *Tree) Load(s getter.Storage, mode GetMode) error {
 				"module %s: not found, may need to be downloaded using 'terraform get'", m.Name)
 		}
 
-		// Expand the subDir if required.
-		dir, err = getter.SubdirGlob(dir, subDir)
-		if err != nil {
-			return err
+		// expand and record the subDir for later
+		if subDir != "" {
+			fullDir, err := getter.SubdirGlob(dir, subDir)
+			if err != nil {
+				return err
+			}
+
+			// +1 to account for the pathsep
+			if len(dir)+1 > len(fullDir) {
+				return fmt.Errorf("invalid module storage path %q", fullDir)
+			}
+
+			subDir = fullDir[len(dir)+1:]
+
+			if err := t.recordSubdir(dir, subDir); err != nil {
+				return err
+			}
+			dir = fullDir
 		}
 
 		// Load the configurations.Dir(source)
 		children[m.Name], err = NewTreeModule(m.Name, dir)
 		if err != nil {
-			return fmt.Errorf(
-				"module %s: %s", m.Name, err)
+			return fmt.Errorf("module %s: %s", m.Name, err)
 		}
-
 		// Set the path of this child
 		children[m.Name].path = path
 	}
@@ -252,6 +294,63 @@ func (t *Tree) Load(s getter.Storage, mode GetMode) error {
 	t.children = children
 
 	return nil
+}
+
+const subdirRecordPrefix = ".tf-module-subdir-"
+
+// Mark the location of a detected subdir in a top-level file so we
+// can skip detection when not updating the module.
+func (t *Tree) recordSubdir(dir, subDir string) error {
+	// remove any existing records
+	fs, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	for _, f := range fs {
+		if strings.HasPrefix(f.Name(), subdirRecordPrefix) {
+			err := os.RemoveAll(filepath.Join(dir, f.Name()))
+			if err != nil {
+				log.Printf("[WARN] failed to remove subdir record %q: %s", f.Name(), err)
+			}
+		}
+	}
+
+	f, err := ioutil.TempFile(dir, subdirRecordPrefix)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	_, err = f.Write([]byte(subDir))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Look for a recorded subdir in the module source, so we can skip detection.
+func (r *Tree) getSubdir(dir string) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(dir, subdirRecordPrefix+"*"))
+	if err != nil {
+		return "", err
+	}
+
+	if len(matches) == 0 {
+		return "", nil
+	}
+
+	if len(matches) > 1 {
+		// More than one record for some reason, continue detection and fix it
+		// with recordSubdir.
+		return "", fmt.Errorf("multiple module subdir records")
+	}
+
+	subDir, err := ioutil.ReadFile(matches[0])
+	if err != nil {
+		return "", err
+	}
+
+	return strings.TrimSpace(string(subDir)), nil
 }
 
 // Path is the full path to this tree.
